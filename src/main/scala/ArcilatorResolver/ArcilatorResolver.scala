@@ -5,7 +5,6 @@ import java.nio.file.{Files, Path, Paths}
 import scala.sys.process._
 
 object ArcilatorResolver {
-
     def resolve(version: String): Path = {
         val userHome     = System.getProperty("user.home")
         val cacheBaseDir = Paths.get(userHome, ".cache", "llvm-circt")
