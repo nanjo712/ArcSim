@@ -99,20 +99,30 @@ private object ArcilatorBackend {
 
 private final class DefaultSimSession(adapter: ArcilatorRuntimeBackend, artifacts: SimArtifacts, config: SimConfig)
     extends SimSession {
-    private var closed = false
+  private var closed = false
 
-    def poke(path: String, value: BigInt): Unit = {
+  def poke(path: String, value: BigInt): Unit = {
         ensureOpen()
         validatePath(path)
-        validateValue(value)
-        adapter.poke(path, value)
-    }
+    validateValue(value)
+    adapter.poke(path, value)
+  }
 
-    def peek(path: String): BigInt = {
-        ensureOpen()
-        validatePath(path)
-        adapter.peek(path)
-    }
+  def poke(signal: chisel3.Data, value: BigInt): Unit = {
+    val path = adapter.resolvePath(signal, forWrite = true)
+    poke(path, value)
+  }
+
+  def peek(path: String): BigInt = {
+    ensureOpen()
+    validatePath(path)
+    adapter.peek(path)
+  }
+
+  def peek(signal: chisel3.Data): BigInt = {
+    val path = adapter.resolvePath(signal, forWrite = false)
+    peek(path)
+  }
 
     def step(cycles: Int): Unit = {
         ensureOpen()
@@ -145,11 +155,11 @@ private final class DefaultSimSession(adapter: ArcilatorRuntimeBackend, artifact
         }
     }
 
-    private def validateValue(value: BigInt): Unit = {
+  private def validateValue(value: BigInt): Unit = {
         if (value < 0) {
             throw InvalidValueException(s"Only non-negative values are supported in MVP, got $value")
-        }
-    }
+  }
+}
 }
 
 private final class ArcilatorRuntimeBackend(artifacts: SimArtifacts) {
@@ -159,8 +169,30 @@ private final class ArcilatorRuntimeBackend(artifacts: SimArtifacts) {
     private val stateBuffer   = new Array[Byte](stateInfo.numStateBytes)
     private val evalFnName    = s"${artifacts.topName}_eval"
     private val evalInvoker   = NativeBridge.loadEval(sharedLibPath, evalFnName, stateInfo.numStateBytes)
-    private var cycleCount    = BigInt(0)
-    private var closed        = false
+  private var cycleCount    = BigInt(0)
+  private var closed        = false
+
+  def resolvePath(signal: chisel3.Data, forWrite: Boolean): String = {
+    val raw = signal.pathName
+    if (raw == null || raw.trim.isEmpty) {
+      throw InvalidSignalPathException("")
+    }
+
+    val dotParts = raw.split('.').toSeq.filter(_.nonEmpty)
+    val stripped = if (dotParts.length >= 2) dotParts.tail else dotParts
+    val resolved = stripped.mkString("_")
+    if (resolved.trim.isEmpty) {
+      throw InvalidSignalPathException(raw)
+    }
+
+    val lookup = if (forWrite) stateInfo.inputs else stateInfo.readable
+    if (lookup.contains(resolved)) {
+      resolved
+    } else {
+      val what = if (forWrite) "writable input" else "readable signal"
+      throw UnknownSignalException(s"$raw (flattened: $resolved, no $what match)")
+    }
+  }
 
     def poke(path: String, value: BigInt): Unit = {
         ensureOpen()
