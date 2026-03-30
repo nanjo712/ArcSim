@@ -1,28 +1,35 @@
 package ArcilatorResolver
 
 import org.scalatest.flatspec.AnyFlatSpec
-import org.scalatest.BeforeAndAfter
-import java.nio.file.{Files, Path, Paths}
+import org.scalatest.matchers.should.Matchers
+import java.nio.file.{Files, Path}
 
 import chisel3._
 
-class ArcilatorResolverSpec extends AnyFlatSpec with BeforeAndAfter {
+class ArcilatorResolverSpec extends AnyFlatSpec with Matchers {
     behavior of "ArcilatorResolver"
 
-    val testVersion = chisel3.BuildInfo.firtoolVersion.getOrElse("firtool-1.62.0")
+    val testVersion = chisel3.BuildInfo.firtoolVersion.getOrElse("1.139.0")
 
-    after {
-        // Clean up the cache directory after the test to avoid leaving large files on the system
-        val userHome     = System.getProperty("user.home")
-        val cacheBaseDir = Paths.get(userHome, ".cache", "llvm-circt")
-        val targetDir    = cacheBaseDir.resolve(testVersion)
-        if (Files.exists(targetDir)) {
-            println(s"Cleaning up cache directory: $targetDir")
-            Files.walk(targetDir).sorted(java.util.Comparator.reverseOrder()).forEach(Files.delete)
+    it should "download and extract the correct version of circt" in {
+        val cacheBaseDir = Files.createTempDirectory("arcilator-resolver-test-")
+        try {
+            val arcilator = ArcilatorResolver.resolve(testVersion, cacheBaseDir)
+            Files.exists(arcilator) shouldBe true
+        } finally {
+            deleteRecursively(cacheBaseDir)
         }
     }
 
-    it should "download and extract the correct version of circt" in {
-        ArcilatorResolver.resolve(testVersion)
+    private def deleteRecursively(path: Path): Unit = {
+        if (!Files.exists(path)) {
+            return
+        }
+        val paths = Files.walk(path).sorted(java.util.Comparator.reverseOrder())
+        try {
+            paths.forEach(Files.delete)
+        } finally {
+            paths.close()
+        }
     }
 }
