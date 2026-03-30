@@ -20,5 +20,14 @@ jobs:
         uses: coursier/setup-action@v1
         with:
           jvm: temurin:17
+      - name: Setup Verilator via Conda
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-name: verilator-env
+          create-args: >-
+            verilator=5.028
+            -c conda-forge
+          cache-environment: true
+          init-shell: bash
       - name: mill Test
         run: ./mill _.test
