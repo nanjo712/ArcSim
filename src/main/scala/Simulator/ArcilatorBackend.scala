@@ -1,6 +1,7 @@
 package Simulator
 
 import ArcilatorResolver.ArcilatorResolver
+import chisel3._
 import com.sun.jna.FunctionMapper
 import com.sun.jna.Library
 import com.sun.jna.Memory
@@ -13,6 +14,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Locale
+import chisel3.experimental.BundleLiterals._
+import chisel3.experimental.VecLiterals._
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
 import scala.util.Try
@@ -101,27 +104,47 @@ private final class DefaultSimSession(adapter: ArcilatorRuntimeBackend, artifact
     extends SimSession {
   private var closed = false
 
-  def poke(path: String, value: BigInt): Unit = {
+  private def pokeRaw(path: String, value: BigInt): Unit = {
         ensureOpen()
         validatePath(path)
     validateValue(value)
     adapter.poke(path, value)
   }
 
-  def poke(signal: chisel3.Data, value: BigInt): Unit = {
-    val path = adapter.resolvePath(signal, forWrite = true)
-    poke(path, value)
+  def poke(signal: chisel3.Data, value: chisel3.Data): Unit = {
+    ensureOpen()
+    if (signal == null || value == null) {
+      throw SignalTypeMismatchException("poke(Data, Data) does not accept null")
+    }
+    if (!value.isLit) {
+      throw SignalTypeMismatchException(
+        s"poke(Data, Data) requires literal value, got non-literal ${value.getClass.getSimpleName}"
+      )
+    }
+    PokeDataSupport.pokeAggregateOrLeaf(this, signal, value)
   }
 
-  def peek(path: String): BigInt = {
+  private def peekRaw(path: String): BigInt = {
     ensureOpen()
     validatePath(path)
     adapter.peek(path)
   }
 
-  def peek(signal: chisel3.Data): BigInt = {
+  def peekData[T <: chisel3.Data](signal: T): T = {
+    ensureOpen()
+    PeekDataSupport.peekAs(signal, d => peekLeafBigInt(d)).asInstanceOf[T]
+  }
+
+  private def peekLeafBigInt(signal: chisel3.Data): BigInt = {
+    signal match {
+      case _: chisel3.Bool | _: chisel3.UInt | _: chisel3.SInt =>
+      case _ =>
+        throw SignalTypeMismatchException(
+          s"peek(Data) supports Bool/UInt/SInt only, got ${signal.getClass.getSimpleName} at ${signal.pathName}"
+        )
+    }
     val path = adapter.resolvePath(signal, forWrite = false)
-    peek(path)
+    peekRaw(path)
   }
 
     def step(cycles: Int): Unit = {
@@ -160,6 +183,140 @@ private final class DefaultSimSession(adapter: ArcilatorRuntimeBackend, artifact
             throw InvalidValueException(s"Only non-negative values are supported in MVP, got $value")
   }
 }
+
+  private def validateKnownWidth(path: String, width: Int): Unit = {
+    if (width <= 0) {
+      throw UnknownSignalWidthException(path)
+    }
+  }
+
+  private[Simulator] def pokeLeafSignal(signal: chisel3.Data, value: BigInt): Unit = {
+    signal match {
+      case b: chisel3.Bool =>
+        if (value != 0 && value != 1) {
+          throw InvalidValueException(s"Bool value must be 0 or 1 at ${b.pathName}, got $value")
+        }
+        val path = adapter.resolvePath(b, forWrite = true)
+        pokeRaw(path, value)
+      case u: chisel3.UInt =>
+        validateKnownWidth(u.pathName, u.getWidth)
+        val path = adapter.resolvePath(u, forWrite = true)
+        pokeRaw(path, value)
+      case s: chisel3.SInt =>
+        validateKnownWidth(s.pathName, s.getWidth)
+        val width = s.getWidth
+        val min = -(BigInt(1) << (width - 1))
+        val max = (BigInt(1) << (width - 1)) - 1
+        if (value < min || value > max) {
+          throw InvalidValueException(
+            s"SInt value $value out of range for width=$width at ${s.pathName} (allowed [$min, $max])"
+          )
+        }
+        val encoded = if (value >= 0) value else (BigInt(1) << width) + value
+        val path = adapter.resolvePath(s, forWrite = true)
+        pokeRaw(path, encoded)
+      case other =>
+        throw SignalTypeMismatchException(
+          s"poke leaf supports Bool/UInt/SInt only, got ${other.getClass.getSimpleName} at ${other.pathName}"
+        )
+    }
+  }
+}
+
+private object PokeDataSupport {
+  def pokeAggregateOrLeaf(session: DefaultSimSession, signal: chisel3.Data, value: chisel3.Data): Unit = {
+    (signal, value) match {
+      case (s: chisel3.Bool, v: chisel3.Bool) =>
+        session.pokeLeafSignal(s, if (v.litValue == 0) BigInt(0) else BigInt(1))
+      case (s: chisel3.UInt, v: chisel3.UInt) =>
+        session.pokeLeafSignal(s, v.litValue)
+      case (s: chisel3.SInt, v: chisel3.SInt) =>
+        val width = v.getWidth
+        if (width <= 0) {
+          throw UnknownSignalWidthException(v.pathName)
+        }
+        val raw = v.litValue
+        val signBit = BigInt(1) << (width - 1)
+        val signed = if ((raw & signBit) == 0) raw else raw - (BigInt(1) << width)
+        session.pokeLeafSignal(s, signed)
+      case (s: chisel3.Record, v: chisel3.Record) =>
+        pokeRecord(session, s, v)
+      case (s: chisel3.Vec[_], v: chisel3.Vec[_]) =>
+        pokeVec(session, s, v)
+      case (s, v) =>
+        throw SignalTypeMismatchException(
+          s"poke type mismatch: signal=${s.getClass.getSimpleName}(${s.pathName}), value=${v.getClass.getSimpleName}(${v.pathName})"
+        )
+    }
+  }
+
+  private def pokeRecord(session: DefaultSimSession, signal: chisel3.Record, value: chisel3.Record): Unit = {
+    val sElems = signal.elements
+    val vElems = value.elements
+    val sNames = sElems.keys.toSet
+    val vNames = vElems.keys.toSet
+    if (sNames != vNames) {
+      throw SignalTypeMismatchException(
+        s"Record field mismatch at ${signal.pathName}: signal fields=${sNames.mkString(",")}, value fields=${vNames.mkString(",")}"
+      )
+    }
+    sElems.foreach { case (name, sField) =>
+      val vField = vElems(name)
+      pokeAggregateOrLeaf(session, sField, vField)
+    }
+  }
+
+  private def pokeVec(session: DefaultSimSession, signal: chisel3.Vec[_], value: chisel3.Vec[_]): Unit = {
+    if (signal.length != value.length) {
+      throw SignalTypeMismatchException(
+        s"Vec length mismatch at ${signal.pathName}: signal length=${signal.length}, value length=${value.length}"
+      )
+    }
+    var i = 0
+    while (i < signal.length) {
+      val sElem = signal(i).asInstanceOf[chisel3.Data]
+      val vElem = value(i).asInstanceOf[chisel3.Data]
+      pokeAggregateOrLeaf(session, sElem, vElem)
+      i += 1
+    }
+  }
+}
+
+private object PeekDataSupport {
+  def peekAs(signal: chisel3.Data, readLeaf: chisel3.Data => BigInt): chisel3.Data = {
+    signal match {
+      case b: chisel3.Bool =>
+        val raw = readLeaf(b)
+        if (raw == 0) false.B else if (raw == 1) true.B
+        else throw BackendCrashedException(s"Bool signal ${b.pathName} has non-bool value $raw")
+      case u: chisel3.UInt =>
+        val width = u.getWidth
+        if (width <= 0) throw UnknownSignalWidthException(u.pathName)
+        readLeaf(u).U(width.W)
+      case s: chisel3.SInt =>
+        val width = s.getWidth
+        if (width <= 0) throw UnknownSignalWidthException(s.pathName)
+        val raw = readLeaf(s)
+        val signBit = BigInt(1) << (width - 1)
+        val signed = if ((raw & signBit) == 0) raw else raw - (BigInt(1) << width)
+        signed.S(width.W)
+      case r: chisel3.Record =>
+        val clone = r.cloneType.asInstanceOf[chisel3.Record]
+        val fields = r.elements.keys.toSeq.map { name =>
+          val litChild = peekAs(r.elements(name), readLeaf)
+          ((x: chisel3.Record) => x.elements(name) -> litChild)
+        }
+        clone.Lit(fields: _*)
+      case v: chisel3.Vec[_] =>
+        val clone = v.cloneType.asInstanceOf[chisel3.Vec[chisel3.Data]]
+        val assigns = (0 until v.length).map { i =>
+          i -> peekAs(v(i).asInstanceOf[chisel3.Data], readLeaf)
+        }
+        clone.Lit(assigns: _*)
+      case other =>
+        throw SignalTypeMismatchException(s"peek not supported for ${other.getClass.getSimpleName} at ${other.pathName}")
+    }
+  }
 }
 
 private final class ArcilatorRuntimeBackend(artifacts: SimArtifacts) {
@@ -180,7 +337,7 @@ private final class ArcilatorRuntimeBackend(artifacts: SimArtifacts) {
 
     val dotParts = raw.split('.').toSeq.filter(_.nonEmpty)
     val stripped = if (dotParts.length >= 2) dotParts.tail else dotParts
-    val resolved = stripped.mkString("_")
+    val resolved = stripped.mkString("_").replace('[', '_').replace("]", "")
     if (resolved.trim.isEmpty) {
       throw InvalidSignalPathException(raw)
     }
