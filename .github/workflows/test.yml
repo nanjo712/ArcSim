@@ -29,5 +29,8 @@ jobs:
             -c conda-forge
           cache-environment: true
           init-shell: bash
-      - name: mill Test
-        run: ./mill _.test
+      - name: Run Mill Tests
+        shell: bash -l {0}
+        run: |
+          verilator --version
+          ./mill _.test
